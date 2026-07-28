@@ -327,19 +327,16 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
             for m in msgs:
                 print(m)
             EXAMPLE_SHOWN = True
-        async with sem:
-            try:
-                g = await llm.chat(msgs, max_tok)
-            except Exception as e:
-                logger.error("%s error: %s", llm.provider, e)
-                g = ""
-        g = remove_stop_tokens_fast(g.split('\n')[0]).strip()
-        if task in ['sentiment', 'topic', 'news', 'xlni', 'lid']:
-            g = g.lower()
-        if task in ['lid']:
-            g = g.lower()[:3]
-        outs.append({"lang_code": ex["lang_code"],
-                     "generation": g, "example_id": str(ex.get("id", ""))})
+        prompt = prepare_chat_format(msgs, llm.model_id)
+        outs.append({
+            "lang_code": ex["lang_code"],
+            "example_id": str(ex.get("id", "")),
+            "messages": msgs,
+            "max_tokens": max_tok,
+            "task": task,
+            "example": ex,
+            "prompt_with_chat_template": prompt
+        })
     return outs
 
 # ─────────────────── benchmark one task ──────────────────────
