@@ -1,21 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""
-Universal Sahara-v1 benchmark runner
------------------------------------
-Back-ends
-  • OpenAI (o3 / GPT-4o)      –‐ `--provider openai`       ($OPENAI_API_KEY)
-  • Anthropic Claude-4        –‐ `--provider anthropic`    ($ANTHROPIC_API_KEY)
-  • Local vLLM                –‐ `--provider vllm`         (any HF ckpt)
-  • Transformers              -— `--provider transformers` (any HF ckpt)
 
-Example
---------
-python run_benchmark.py --provider anthropic \
-        --model_id claude-sonnet-4-20250514 \
-        --tasks sentiment paraphrase
-"""
-import multiprocessing
 from tqdm import tqdm
 
 # ───────────────────────── stdlib ────────────────────────────
@@ -27,23 +12,12 @@ import logging
 import warnings
 import asyncio
 import ast
-from typing import List, Dict, Any
 # ──────────────────────── third-party ────────────────────────
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
-from sklearn.metrics import accuracy_score, f1_score
+from datasets import load_dataset, DownloadConfig
 import evaluate
-from tenacity import retry, wait_exponential, stop_after_attempt
-import openai
-import anthropic
-import torch
-from vllm import LLM, SamplingParams
-# New imports for server management and transformers
-import subprocess
-import atexit
-import httpx
-from transformers import pipeline
+
 # ──────────────────────── local helpers ─────────────────────
 from chat_template import prepare_chat_format
 from squad_qa_eval import SQuADEvaluator
@@ -127,148 +101,6 @@ def postprocess_tokens(preds, labels, pad="O"):
 CONCURRENCY = 20
 
 
-class AsyncLLM:
-    # __init__ is now synchronous and lightweight
-    def __init__(self, provider: str, model_id: str):
-        self.provider = provider
-        self.model_id = model_id
-        self.cli = None
-        self.sampler = None
-        self.server_process = None
-
-    @classmethod
-    async def create(cls, provider: str, model_id: str, cache: str | None):
-        """Asynchronous factory to create and initialize an instance."""
-        instance = cls(provider.lower(), model_id)
-
-        if instance.provider == "openai":
-            instance.cli = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        elif instance.provider == "anthropic":
-            instance.cli = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        elif instance.provider == "vllm_server":
-            # Assumes the server is running on the default address http://localhost:8000
-            base_url = "http://127.0.0.1:8000/v1"
-            logger.info("Connecting to existing remote server at %s", base_url)
-            # The API key is a dummy value for the vLLM server
-            instance.cli = openai.AsyncOpenAI(
-                base_url=base_url, api_key="vllm")
-        elif instance.provider == "vllm":
-            logger.info("Loading vLLM %s …", model_id)
-            kw = dict(model=model_id, dtype=torch.bfloat16,
-                      gpu_memory_utilization=0.95,
-                      tensor_parallel_size=torch.cuda.device_count(),
-                      max_model_len=8192)
-            if cache:
-                kw["download_dir"] = cache
-            instance.cli = LLM(**kw)
-            instance.sampler = SamplingParams(temperature=0.0, max_tokens=128,
-                                              stop=["<|assistant|>", "<|user|>", "<|system|>", "</s>", "<|im_end|>", "<|endoftext|>", "<end_of_turn>", "</chat_message>", "\n\n"])
-        elif instance.provider == "transformers":
-            logger.info("Loading transformers pipeline for %s...", model_id)
-
-            def _load_pipeline():
-                # This synchronous function will be run in a separate thread
-                kwargs = {
-                    "model": model_id,
-                    "torch_dtype": torch.bfloat16,
-                    "device_map": "auto",
-                    "temperature": 0.95,
-                }
-
-                p = pipeline("text-generation", **kwargs)
-
-                # Set pad_token if not present for open-ended generation
-                if p.tokenizer.pad_token_id is None:
-                    p.tokenizer.pad_token_id = p.tokenizer.eos_token_id
-                return p
-
-            # Run the blocking pipeline creation in a thread to not block the event loop
-            instance.cli = await asyncio.to_thread(_load_pipeline)
-
-        return instance
-
-    def kill_server(self):
-        if self.server_process:
-            logger.info("Shutting down vLLM server process...")
-            self.server_process.terminate()
-            self.server_process.wait()
-
-    async def _wait_for_server_ready(self, host, port):
-        health_url = f"http://{host}:{port}/health"
-        timeout = 180
-        start_time = time.time()
-        logger.info("Waiting for vLLM server to be ready...")
-        async with httpx.AsyncClient() as client:
-            while time.time() - start_time < timeout:
-                try:
-                    response = await client.get(health_url)
-                    if response.status_code == 200:
-                        logger.info("vLLM server is up and running.")
-                        return
-                except httpx.ConnectError:
-                    pass
-                await asyncio.sleep(2)
-        self.kill_server()
-        raise RuntimeError(
-            f"vLLM server failed to start within {timeout} seconds. Check vllm_server.log.")
-
-    @retry(wait=wait_exponential(1, 4, 30), stop=stop_after_attempt(10))
-    async def _api_call(self, msgs, max_tok):
-        if self.provider == "openai":
-            r = await self.cli.chat.completions.create(
-                model=self.model_id, messages=msgs, max_tokens=max_tok, temperature=0.0)
-            return r.choices[0].message.content.strip()
-        elif self.provider == "vllm_server":
-            # print("-------",msgs)
-            r = await self.cli.chat.completions.create(
-                model=self.model_id, messages=msgs, temperature=0.0)
-            # print(">>>>>", r)
-            # print("+++++++++", r.choices[0].message.content.strip())
-            return r.choices[0].message.content.strip()
-        elif self.provider == "anthropic":
-            r = await self.cli.messages.create(
-                model=self.model_id, messages=msgs, max_tokens=max_tok, temperature=0.0)
-            return r.content[0].text.strip()
-
-    async def chat(self, msgs, max_tok):
-        if self.provider in {"openai", "anthropic", "vllm_server"}:
-            return await self._api_call(msgs, max_tok)
-        elif self.provider == "vllm":
-            prompt = prepare_chat_format(msgs, self.model_id)
-            sampling_params = SamplingParams(
-                temperature=self.sampler.temperature,
-                max_tokens=max_tok,
-                stop=self.sampler.stop
-            )
-            outs = self.cli.generate([prompt], sampling_params)
-            return outs[0].outputs[0].text.strip()
-        elif self.provider == "transformers":
-            # Use the pipeline's tokenizer to apply the chat template
-            prompt = self.cli.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-
-            def _sync_generate():
-                # Use return_full_text=False to get only the new text
-
-                outputs = self.cli(
-                    prompt,
-                    max_new_tokens=max_tok,
-                    # To use temperature for sampling, 'do_sample' must be True
-                    do_sample=True,
-                    # The 'stop' parameter is invalid; use 'stop_sequence' for the pipeline
-                    # stop_sequence=self.sampler.stop,
-                    # These other parameters are fine
-                    return_full_text=False,
-                    pad_token_id=self.cli.tokenizer.eos_token_id
-                )
-
-                return outputs[0]['generated_text'].strip()
-
-            # Run the synchronous pipeline call in a separate thread
-            return await asyncio.to_thread(_sync_generate)
-
-
 # ─────────────────── inference helpers ───────────────────────
 EXAMPLE_SHOWN = False
 # Even faster version using translate method
@@ -298,7 +130,7 @@ def remove_stop_tokens_fast(text):
     return text.strip()
 
 
-async def infer_batch(batch, base, llm, task, max_tok, sem):
+async def infer_batch(batch, base, task, max_tok):
     global EXAMPLE_SHOWN
     outs = []
     # for ex in batch:
@@ -327,7 +159,7 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
             for m in msgs:
                 print(m)
             EXAMPLE_SHOWN = True
-        prompt = prepare_chat_format(msgs, llm.model_id)
+        prompt = prepare_chat_format(msgs, "Sunbird/Sunflower-Qwen3.5-9B")
         outs.append({
             "lang_code": ex["lang_code"],
             "example_id": str(ex.get("id", "")),
@@ -342,12 +174,24 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
 # ─────────────────── benchmark one task ──────────────────────
 
 
-async def bench_task(provider, task, llm, data_dir, cache, batch):
+async def bench_task(provider, task, data_dir, cache, batch):
     global EXAMPLE_SHOWN
     EXAMPLE_SHOWN = False
     t0 = time.time()
-    data = load_dataset(path=data_dir, name=task, trust_remote_code=True,
-                        download_mode="force_redownload", cache_dir=cache)
+    download_config = DownloadConfig(
+        cache_dir=cache,
+        max_retries=10,
+        resume_download=True,
+    )
+
+    data = load_dataset(
+        path=data_dir,
+        name=task,
+        trust_remote_code=True,
+        cache_dir=cache,
+        download_config=download_config,
+        download_mode="reuse_dataset_if_exists",
+    )
     # few-shot setup
     # n_shots=5 if task not in ['topic','news','title','summary', 'lid'] else \
     #       3 if task in ['topic','news'] else 2
@@ -424,11 +268,9 @@ async def bench_task(provider, task, llm, data_dir, cache, batch):
             ])
 
     test = list(data['test'])
-    sem = asyncio.Semaphore(CONCURRENCY)
     results = []
     for i in range(0, len(test), batch):
-        results.extend(await infer_batch(test[i:i+batch], base, llm,
-                                         task, max_tok, sem))
+        results.extend(await infer_batch(test[i:i+batch], base, task, max_tok))
         logger.info("%s batch %d/%d", task,
                     i//batch+1, (len(test)+batch-1)//batch)
         if provider not in ["vllm", "vllm_server", "transformers"]:
@@ -442,17 +284,14 @@ async def bench_task(provider, task, llm, data_dir, cache, batch):
 
 async def main_async(provider, model_id, tasks, data_dir, cache, batch):
     # Change this line to await the new create method
-    llm = await AsyncLLM.create(provider, model_id, cache)
 
     model_safe = model_id.replace("/", "_").replace("-", "_")
     out_dir = f"outputs/{model_safe}"
     os.makedirs(out_dir, exist_ok=True)
     for t in tasks:
-        df, sec = await bench_task(provider, t, llm, data_dir, cache, batch)
+        df, sec = await bench_task(provider, t, data_dir, cache, batch)
         df.to_json(f"{out_dir}/{t}_generation.json",
-                   orient="records", force_ascii=False, lines=True)
-        rec = {"task": t, "provider": provider, "model": model_id,
-               "processing_time_seconds": sec}
+                   orient="records", force_ascii=False)
         logger.info("%s finished (%.1fs): %s", t, sec, "")
 # ─────────────────── CLI ─────────────────────────────────────
 
