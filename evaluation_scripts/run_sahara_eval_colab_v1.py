@@ -12,6 +12,7 @@ import logging
 import warnings
 import asyncio
 import ast
+import random
 # ──────────────────────── third-party ────────────────────────
 import numpy as np
 import pandas as pd
@@ -41,6 +42,44 @@ metric_tokens = evaluate.load("seqeval")
 metric_squad = SQuADEvaluator()
 
 # ─────────────────── JSON helpers (NumPy safe) ──────────────
+
+
+def load_sahara_dataset(data_dir, task, cache, attempts=8):
+    download_config = DownloadConfig(
+        cache_dir=cache,
+        max_retries=5,
+        resume_download=True,
+    )
+
+    for attempt in range(attempts):
+        try:
+            return load_dataset(
+                path=data_dir,
+                name=task,
+                trust_remote_code=True,
+                cache_dir=cache,
+                download_config=download_config,
+                download_mode="reuse_dataset_if_exists",
+            )
+
+        except ConnectionError as exc:
+            is_rate_limit = "error 429" in str(exc) or "429" in str(exc)
+
+            if not is_rate_limit or attempt == attempts - 1:
+                raise
+
+            delay = min(300, 15 * (2**attempt)) + random.uniform(0, 5)
+
+            logger.warning(
+                "Dataset server rate-limited task %s. "
+                "Retrying in %.1f seconds (%d/%d)",
+                task,
+                delay,
+                attempt + 1,
+                attempts,
+            )
+
+            time.sleep(delay)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -178,19 +217,11 @@ async def bench_task(provider, task, data_dir, cache, batch):
     global EXAMPLE_SHOWN
     EXAMPLE_SHOWN = False
     t0 = time.time()
-    download_config = DownloadConfig(
-        cache_dir=cache,
-        max_retries=10,
-        resume_download=True,
-    )
 
-    data = load_dataset(
-        path=data_dir,
-        name=task,
-        trust_remote_code=True,
-        cache_dir=cache,
-        download_config=download_config,
-        download_mode="reuse_dataset_if_exists",
+    data = data = load_sahara_dataset(
+        data_dir=data_dir,
+        task=task,
+        cache=cache,
     )
     # few-shot setup
     # n_shots=5 if task not in ['topic','news','title','summary', 'lid'] else \
