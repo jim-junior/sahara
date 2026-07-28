@@ -474,6 +474,13 @@ def parse_args():
 
 def main():
     a = parse_args()
+    print("==========================================================")
+    print("==========================================================")
+    print("==========================================================")
+    print("Running Sahara-v1 benchmark for collecting model prompts")
+    print("===========================================================")
+    print("===========================================================")
+    print("===========================================================")
     logger.info("provider=%s model=%s tasks=%s",
                 a.provider, a.model_id, a.tasks)
     asyncio.run(main_async(a.provider, a.model_id, a.tasks,
