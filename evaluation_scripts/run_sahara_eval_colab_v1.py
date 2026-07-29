@@ -44,6 +44,7 @@ import subprocess
 import atexit
 import httpx
 from transformers import pipeline
+from transformers import AutoTokenizer
 # ──────────────────────── local helpers ─────────────────────
 from chat_template import prepare_chat_format
 from squad_qa_eval import SQuADEvaluator
@@ -135,6 +136,7 @@ class AsyncLLM:
         self.cli = None
         self.sampler = None
         self.server_process = None
+        self.tokenizer = None  # For transformers provider
 
     @classmethod
     async def create(cls, provider: str, model_id: str, cache: str | None):
@@ -161,6 +163,7 @@ class AsyncLLM:
             if cache:
                 kw["download_dir"] = cache
             instance.cli = LLM(**kw)
+            instance.tokenizer = AutoTokenizer.from_pretrained(model_id)
             instance.sampler = SamplingParams(temperature=0.0, max_tokens=128,
                                               stop=["<|assistant|>", "<|user|>", "<|system|>", "</s>", "<|im_end|>", "<|endoftext|>", "<end_of_turn>", "</chat_message>", "\n\n"])
         elif instance.provider == "transformers":
@@ -232,16 +235,21 @@ class AsyncLLM:
 
     async def chat(self, msgs, max_tok):
         if self.provider in {"openai", "anthropic", "vllm_server"}:
-            return await self._api_call(msgs, max_tok)
+            return await self._api_call(msgs, max_tok), None
         elif self.provider == "vllm":
-            prompt = prepare_chat_format(msgs, self.model_id)
+            prompt = self.tokenizer.apply_chat_template(
+                msgs,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False  # Tells the Jinja template to skip <think> blocks
+            )
             sampling_params = SamplingParams(
                 temperature=self.sampler.temperature,
                 max_tokens=max_tok,
                 stop=self.sampler.stop
             )
             outs = self.cli.generate([prompt], sampling_params)
-            return outs[0].outputs[0].text.strip()
+            return outs[0].outputs[0].text.strip(), prompt
         elif self.provider == "transformers":
             # Use the pipeline's tokenizer to apply the chat template
             prompt = self.cli.tokenizer.apply_chat_template(
@@ -263,10 +271,10 @@ class AsyncLLM:
                     pad_token_id=self.cli.tokenizer.eos_token_id
                 )
 
-                return outputs[0]['generated_text'].strip()
+                return outputs[0]['generated_text'].strip(), None
 
             # Run the synchronous pipeline call in a separate thread
-            return await asyncio.to_thread(_sync_generate)
+            return await asyncio.to_thread(_sync_generate), None
 
 
 # ─────────────────── inference helpers ───────────────────────
@@ -329,7 +337,8 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
             EXAMPLE_SHOWN = True
         async with sem:
             try:
-                g = await llm.chat(msgs, max_tok)
+                raw_output, prompt = await llm.chat(msgs, max_tok)
+                g = raw_output
             except Exception as e:
                 logger.error("%s error: %s", llm.provider, e)
                 g = ""
@@ -338,8 +347,17 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
             g = g.lower()
         if task in ['lid']:
             g = g.lower()[:3]
-        outs.append({"lang_code": ex["lang_code"],
-                     "generation": g, "example_id": str(ex.get("id", ""))})
+        outs.append({
+            "example_id": str(ex.get("id", "")),
+            "lang_code": ex["lang_code"],
+            "task": task,
+            "input": ex["input"],
+            "model_prompt": prompt,
+            "generation": g,
+            "raw_generation": raw_output,
+            "message_sequence": msgs,
+
+        })
     return outs
 
 # ─────────────────── benchmark one task ──────────────────────
@@ -449,11 +467,14 @@ async def main_async(provider, model_id, tasks, data_dir, cache, batch):
 
     model_safe = model_id.replace("/", "_").replace("-", "_")
     out_dir = f"outputs/{model_safe}"
+    csv_dir = f"outputs/{model_safe}/csv"
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
     for t in tasks:
         df, sec = await bench_task(provider, t, llm, data_dir, cache, batch)
         df.to_json(f"{out_dir}/{t}_generation.json",
                    orient="records", force_ascii=False, lines=True)
+        df.to_csv(f"{csv_dir}/{t}_generation.csv", index=False)
         rec = {"task": t, "provider": provider, "model": model_id,
                "processing_time_seconds": sec}
         logger.info("%s finished (%.1fs): %s", t, sec, "")
