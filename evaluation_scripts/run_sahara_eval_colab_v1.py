@@ -309,6 +309,7 @@ def remove_stop_tokens_fast(text):
 async def infer_batch(batch, base, llm, task, max_tok, sem):
     global EXAMPLE_SHOWN
     outs = []
+    sahara_out = []
     # for ex in batch:
     for ex in tqdm(batch, desc="Processing Batch"):
         msgs = base.copy()
@@ -358,7 +359,13 @@ async def infer_batch(batch, base, llm, task, max_tok, sem):
             "message_sequence": msgs,
 
         })
-    return outs
+
+        sahara_out.append({
+            "lang_code": ex["lang_code"],
+            "generation": g,
+            "example_id": str(ex.get("id", "")),
+        })
+    return outs, sahara_out
 
 # ─────────────────── benchmark one task ──────────────────────
 
@@ -447,16 +454,20 @@ async def bench_task(provider, task, llm, data_dir, cache, batch):
     test = list(data['test'])
     sem = asyncio.Semaphore(CONCURRENCY)
     results = []
+    sahara_results = []
     for i in range(0, len(test), batch):
-        results.extend(await infer_batch(test[i:i+batch], base, llm,
-                                         task, max_tok, sem))
+        outs, sahara_out = await infer_batch(test[i:i+batch], base, llm,
+                                             task, max_tok, sem)
+        sahara_results.extend(sahara_out)
+        results.extend(outs)
         logger.info("%s batch %d/%d", task,
                     i//batch+1, (len(test)+batch-1)//batch)
         if provider not in ["vllm", "vllm_server", "transformers"]:
             time.sleep(10)
         # break
     df = pd.DataFrame(results)
-    return df, round(time.time()-t0, 2)
+    sahara_df = pd.DataFrame(sahara_results)
+    return df, sahara_df, round(time.time()-t0, 2)
 
 # ─────────────────── orchestrator ────────────────────────────
 
@@ -471,9 +482,9 @@ async def main_async(provider, model_id, tasks, data_dir, cache, batch):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(csv_dir, exist_ok=True)
     for t in tasks:
-        df, sec = await bench_task(provider, t, llm, data_dir, cache, batch)
-        df.to_json(f"{out_dir}/{t}_generation.json",
-                   orient="records", force_ascii=False, lines=True)
+        df, sahara_df, sec = await bench_task(provider, t, llm, data_dir, cache, batch)
+        sahara_df.to_json(f"{out_dir}/{t}_generation.json",
+                          orient="records", force_ascii=False, lines=True)
         df.to_csv(f"{csv_dir}/{t}_generation.csv", index=False)
         rec = {"task": t, "provider": provider, "model": model_id,
                "processing_time_seconds": sec}
